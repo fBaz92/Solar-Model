@@ -68,82 +68,198 @@ class PVModule:
 
     def extract_parameters(self):
         """
-        Extract the five parameters of the single-diode model:
-        - A (diode ideality factor)
-        - Rs (series resistance)
-        - Rsh (shunt resistance)
-        - Io (dark saturation current)
-        - Iph (photocurrent)
+        Extract the five parameters of the single-diode model following exactly
+        the flowchart in Fig. 2 of the paper by Sera et al.
         """
-        # Initial guesses
-        A_initial = 1.3  # Common ideality factor value
-        Rs_initial = 0.1  # Initial guess for series resistance
-        Rsh_initial = 1000  # Initial guess for shunt resistance
+        # Initialize parameters
+        Rs = 0.1  # Initial guess for series resistance
+        Rsh = 1000  # Initial guess for shunt resistance
+        A = 1.3  # Initial guess for ideality factor
 
-        # Define objective function to minimize for parameter extraction
-        def objective_function(params):
-            Rs, Rsh, A = params
+        # Maximum iterations and tolerances
+        MAX_ITERATIONS = 100
+        TOL_DPDV = 1e-6
+        TOL_DIDV = 1e-4  # Increased tolerance for dI/dV at Isc
 
-            # Calculate thermal voltage
-            Vt = A * self.k * self.Tcell_stc / self.q
-
-            # Calculate Io based on Rs and Rsh
+        # Function to calculate Io and Iph from Rs, Rsh, and Vt
+        def calculate_Io_Iph(Rs, Rsh, Vt):
             numerator = self.Isc_stc - (self.Voc_stc - self.Isc_stc * Rs) / Rsh
             denominator = np.exp(self.Voc_stc / (self.ns * Vt))
             Io = numerator / denominator
-
-            # Calculate Iph
             Iph = Io * np.exp(self.Voc_stc / (self.ns * Vt)) + self.Voc_stc / Rsh
+            return Io, Iph
 
-            # Calculate I-V at MPP
-            I_mpp_calc = (
+        # Newton-Raphson method for finding Vt (and thus A) from Impp
+        def find_Vt_from_Impp(Rs, Rsh, Vt_guess):
+            Vt = Vt_guess
+            for _ in range(20):  # Max 20 iterations for this inner loop
+                # Calculate Io and Iph
+                Io, Iph = calculate_Io_Iph(Rs, Rsh, Vt)
+
+                # Calculate Impp using Eq. (12)
+                Impp_calc = (
+                    Iph
+                    - Io * np.exp((self.Vmpp_stc + self.Impp_stc * Rs) / (self.ns * Vt))
+                    - (self.Vmpp_stc + self.Impp_stc * Rs) / Rsh
+                )
+
+                # If close enough, return
+                if abs(Impp_calc - self.Impp_stc) < 1e-10:
+                    break
+
+                # Calculate derivative of Impp with respect to Vt (simplified approximation)
+                delta_Vt = Vt * 0.001
+                Vt_plus = Vt + delta_Vt
+
+                Io_plus, Iph_plus = calculate_Io_Iph(Rs, Rsh, Vt_plus)
+                Impp_calc_plus = (
+                    Iph_plus
+                    - Io_plus
+                    * np.exp((self.Vmpp_stc + self.Impp_stc * Rs) / (self.ns * Vt_plus))
+                    - (self.Vmpp_stc + self.Impp_stc * Rs) / Rsh
+                )
+
+                dImpp_dVt = (Impp_calc_plus - Impp_calc) / delta_Vt
+
+                # Newton-Raphson update
+                delta_Vt = (self.Impp_stc - Impp_calc) / dImpp_dVt
+
+                # Limit step size
+                delta_Vt = max(min(delta_Vt, Vt * 0.1), -Vt * 0.1)
+
+                Vt += delta_Vt
+
+                # Check convergence
+                if abs(delta_Vt) < 1e-10:
+                    break
+
+            return Vt
+
+        # Bisection method for finding Rsh from dP/dV at MPP
+        def find_Rsh_from_dPdV(Rs, Vt, Rsh_min=50, Rsh_max=5000):
+            Rsh_low = Rsh_min
+            Rsh_high = Rsh_max
+
+            for _ in range(30):  # Max 30 iterations
+                Rsh_mid = (Rsh_low + Rsh_high) / 2
+
+                # Calculate Io and Iph
+                Io, Iph = calculate_Io_Iph(Rs, Rsh_mid, Vt)
+
+                # Calculate dP/dV at MPP using numerical differentiation for stability
+                delta_V = 0.001 * self.Vmpp_stc
+
+                # Calculate power at Vmpp + delta_V
+                V_plus = self.Vmpp_stc + delta_V
+                I_plus = (
+                    Iph
+                    - Io * np.exp((V_plus + self.Impp_stc * Rs) / (self.ns * Vt))
+                    - (V_plus + self.Impp_stc * Rs) / Rsh_mid
+                )
+                P_plus = V_plus * I_plus
+
+                # Calculate power at Vmpp - delta_V
+                V_minus = self.Vmpp_stc - delta_V
+                I_minus = (
+                    Iph
+                    - Io * np.exp((V_minus + self.Impp_stc * Rs) / (self.ns * Vt))
+                    - (V_minus + self.Impp_stc * Rs) / Rsh_mid
+                )
+                P_minus = V_minus * I_minus
+
+                # Calculate dP/dV
+                dPdV = (P_plus - P_minus) / (2 * delta_V)
+
+                # Bisection update
+                if dPdV > 0:
+                    Rsh_low = Rsh_mid
+                else:
+                    Rsh_high = Rsh_mid
+
+                # Check convergence
+                if abs(dPdV) < TOL_DPDV or (Rsh_high - Rsh_low) < 1:
+                    break
+
+            return Rsh_mid
+
+        # Calculate dI/dV at Isc
+        def calculate_dIdV_at_Isc(Rs, Rsh, Vt):
+            # Calculate using numerical differentiation for stability
+            Io, Iph = calculate_Io_Iph(Rs, Rsh, Vt)
+
+            delta_V = 0.001  # Small voltage step
+
+            # Get I at V = 0 (short circuit)
+            I_sc = (
                 Iph
-                - Io * np.exp((self.Vmpp_stc + self.Impp_stc * Rs) / (self.ns * Vt))
-                - (self.Vmpp_stc + self.Impp_stc * Rs) / Rsh
+                - Io * np.exp(self.Isc_stc * Rs / (self.ns * Vt))
+                - (self.Isc_stc * Rs) / Rsh
             )
 
-            # Calculate dP/dV at MPP (should be zero)
-            # This is a simplified approximation
-            dP_dV = self.Impp_stc + self.Vmpp_stc * (
-                -Io / Vt * np.exp((self.Vmpp_stc + self.Impp_stc * Rs) / (self.ns * Vt))
-                - 1 / Rsh
+            # Get I at V = delta_V
+            I_delta = (
+                Iph
+                - Io * np.exp((delta_V + self.Isc_stc * Rs) / (self.ns * Vt))
+                - (delta_V + self.Isc_stc * Rs) / Rsh
             )
 
-            # Calculate dI/dV at Isc (should be -1/Rsh)
-            dI_dV_Isc = -1 / Rsh - Io * Rs / (self.ns * Vt) * np.exp(
-                self.Isc_stc * Rs / (self.ns * Vt)
-            )
+            # Calculate dI/dV
+            dIdV = (I_delta - I_sc) / delta_V
 
-            # Return sum of squared errors
-            return (
-                (I_mpp_calc - self.Impp_stc) ** 2
-                + dP_dV**2
-                + (dI_dV_Isc + 1 / Rsh) ** 2
-            )
+            return dIdV
 
-        # Perform optimization
-        bounds = [(0.001, 5), (10, 10000), (1, 2)]  # (Rs, Rsh, A)
-        result = optimize.minimize(
-            objective_function,
-            [Rs_initial, Rsh_initial, A_initial],
-            bounds=bounds,
-            method="L-BFGS-B",
-        )
+        # Main iteration loop
+        converged = False
+        for iteration in range(MAX_ITERATIONS):
+            # Step 1: Find Vt (and thus A) from Impp
+            Vt = find_Vt_from_Impp(Rs, Rsh, A * self.k * self.Tcell_stc / self.q)
+            A = Vt * self.q / (self.k * self.Tcell_stc)
 
-        # Store results
-        self.Rs, self.Rsh, self.A = result.x
+            # Make sure A stays within reasonable bounds
+            A = max(1.0, min(A, 2.0))
+            Vt = A * self.k * self.Tcell_stc / self.q
 
-        # Calculate thermal voltage
-        self.Vt_stc = self.A * self.k * self.Tcell_stc / self.q
+            # Step 2: Find Rsh from dP/dV at MPP
+            Rsh_new = find_Rsh_from_dPdV(Rs, Vt)
 
-        # Calculate Io and Iph at STC
-        numerator = self.Isc_stc - (self.Voc_stc - self.Isc_stc * self.Rs) / self.Rsh
-        denominator = np.exp(self.Voc_stc / (self.ns * self.Vt_stc))
-        self.Io_stc = numerator / denominator
-        self.Iph_stc = (
-            self.Io_stc * np.exp(self.Voc_stc / (self.ns * self.Vt_stc))
-            + self.Voc_stc / self.Rsh
-        )
+            # Step 3: Calculate dI/dV at Isc
+            dIdV_Isc = calculate_dIdV_at_Isc(Rs, Rsh_new, Vt)
+            expected_dIdV = -1 / Rsh_new
+
+            # Step 4: Check convergence
+            if abs(dIdV_Isc - expected_dIdV) < TOL_DIDV:
+                Rsh = Rsh_new
+                converged = True
+                break
+
+            # Step 5: Update Rs based on dI/dV at Isc
+            # If dI/dV is more negative than expected, decrease Rs
+            # If dI/dV is less negative than expected, increase Rs
+            if dIdV_Isc < expected_dIdV:  # More negative
+                Rs_new = Rs * 0.9  # Decrease Rs
+            else:  # Less negative
+                Rs_new = Rs * 1.1  # Increase Rs
+
+            # Update Rs and Rsh
+            Rs = max(0.01, min(Rs_new, 2.0))  # Keep Rs within reasonable bounds
+            Rsh = Rsh_new
+
+            # Print progress every 10 iterations
+            if iteration % 10 == 0:
+                print(
+                    f"Iteration {iteration}: Rs={Rs:.4f}, Rsh={Rsh:.1f}, A={A:.4f}, dI/dV={dIdV_Isc:.6f}, expected={expected_dIdV:.6f}"
+                )
+
+        # Calculate final Io and Iph
+        Io, Iph = calculate_Io_Iph(Rs, Rsh, Vt)
+
+        # Store the final parameters
+        self.Rs = Rs
+        self.Rsh = Rsh
+        self.A = A
+        self.Vt_stc = Vt
+        self.Io_stc = Io
+        self.Iph_stc = Iph
 
         print(f"Extracted parameters for {self.name}:")
         print(f"Series resistance (Rs): {self.Rs:.4f} Ω")
@@ -151,6 +267,8 @@ class PVModule:
         print(f"Ideality factor (A): {self.A:.4f}")
         print(f"Dark saturation current (Io): {self.Io_stc:.2e} A")
         print(f"Photocurrent (Iph): {self.Iph_stc:.4f} A")
+        print(f"Iterations required: {iteration + 1}")
+        print(f"Converged: {converged}")
 
     def get_iv_curve(self, voltage_range=None, irradiance=1000, temperature=25):
         """
