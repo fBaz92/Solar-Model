@@ -68,8 +68,9 @@ class PVModule:
 
     def extract_parameters(self):
         """
-        Extract the five parameters of the single-diode model following exactly
-        the flowchart in Fig. 2 of the paper by Sera et al.
+        Extract the five parameters of the single-diode model following
+        the flowchart in Fig. 2 of the paper by Sera et al., with improved
+        convergence behavior.
         """
         # Initialize parameters
         Rs = 0.1  # Initial guess for series resistance
@@ -79,7 +80,7 @@ class PVModule:
         # Maximum iterations and tolerances
         MAX_ITERATIONS = 100
         TOL_DPDV = 1e-6
-        TOL_DIDV = 1e-4  # Increased tolerance for dI/dV at Isc
+        TOL_DIDV = 1e-4  # Tolerance for dI/dV at Isc
 
         # Function to calculate Io and Iph from Rs, Rsh, and Vt
         def calculate_Io_Iph(Rs, Rsh, Vt):
@@ -210,6 +211,7 @@ class PVModule:
 
         # Main iteration loop
         converged = False
+        previous_diff = None
         for iteration in range(MAX_ITERATIONS):
             # Step 1: Find Vt (and thus A) from Impp
             Vt = find_Vt_from_Impp(Rs, Rsh, A * self.k * self.Tcell_stc / self.q)
@@ -226,28 +228,73 @@ class PVModule:
             dIdV_Isc = calculate_dIdV_at_Isc(Rs, Rsh_new, Vt)
             expected_dIdV = -1 / Rsh_new
 
-            # Step 4: Check convergence
-            if abs(dIdV_Isc - expected_dIdV) < TOL_DIDV:
+            # Calculate difference
+            diff = dIdV_Isc - expected_dIdV
+
+            # Calculate dP/dV at MPP to check convergence
+            Io, Iph = calculate_Io_Iph(Rs, Rsh_new, Vt)
+
+            # Calculate dP/dV at MPP using numerical differentiation
+            delta_V = 0.001 * self.Vmpp_stc
+
+            # Calculate power at Vmpp + delta_V
+            V_plus = self.Vmpp_stc + delta_V
+            I_plus = (
+                Iph
+                - Io * np.exp((V_plus + self.Impp_stc * Rs) / (self.ns * Vt))
+                - (V_plus + self.Impp_stc * Rs) / Rsh_new
+            )
+            P_plus = V_plus * I_plus
+
+            # Calculate power at Vmpp - delta_V
+            V_minus = self.Vmpp_stc - delta_V
+            I_minus = (
+                Iph
+                - Io * np.exp((V_minus + self.Impp_stc * Rs) / (self.ns * Vt))
+                - (V_minus + self.Impp_stc * Rs) / Rsh_new
+            )
+            P_minus = V_minus * I_minus
+
+            # Calculate dP/dV
+            dPdV = (P_plus - P_minus) / (2 * delta_V)
+
+            # Step 4: Check convergence - both criteria from the paper
+            if abs(dPdV) < TOL_DPDV and abs(diff) < TOL_DIDV:
                 Rsh = Rsh_new
                 converged = True
                 break
 
-            # Step 5: Update Rs based on dI/dV at Isc
-            # If dI/dV is more negative than expected, decrease Rs
-            # If dI/dV is less negative than expected, increase Rs
+            # Step 5: Update Rs based on dI/dV at Isc with adaptive step size
+            # Note: The direction is REVERSED from the original implementation
+            # If dI/dV is more negative than expected, INCREASE Rs
+            # If dI/dV is less negative than expected, DECREASE Rs
+
+            # Calculate adaptive step size - larger steps when far from solution
+            # smaller steps when close to solution
+            scale_factor = min(max(abs(diff) / abs(expected_dIdV) * 5, 0.05), 0.2)
+
             if dIdV_Isc < expected_dIdV:  # More negative
-                Rs_new = Rs * 0.9  # Decrease Rs
+                Rs_new = Rs * (1 + scale_factor)  # Increase Rs
             else:  # Less negative
-                Rs_new = Rs * 1.1  # Increase Rs
+                Rs_new = Rs * (1 - scale_factor)  # Decrease Rs
+
+            # Check for oscillation - if sign of difference changes, reduce step size
+            if previous_diff is not None and previous_diff * diff < 0:
+                # Sign changed - we might be oscillating
+                # Move halfway between current and previous Rs
+                Rs_new = (Rs + Rs_new) / 2
+
+            previous_diff = diff
 
             # Update Rs and Rsh
             Rs = max(0.01, min(Rs_new, 2.0))  # Keep Rs within reasonable bounds
             Rsh = Rsh_new
 
             # Print progress every 10 iterations
-            if iteration % 10 == 0:
+            if iteration % 1 == 0:
                 print(
-                    f"Iteration {iteration}: Rs={Rs:.4f}, Rsh={Rsh:.1f}, A={A:.4f}, dI/dV={dIdV_Isc:.6f}, expected={expected_dIdV:.6f}"
+                    f"Iteration {iteration}: Rs={Rs:.4f}, Rsh={Rsh:.1f}, A={A:.4f}, "
+                    f"dI/dV={dIdV_Isc:.6f}, expected={expected_dIdV:.6f}, diff={diff:.6f}, dP/dV={dPdV:.6f}"
                 )
 
         # Calculate final Io and Iph
