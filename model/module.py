@@ -165,12 +165,10 @@ class PVModule:
         return self._newton_raphson(f, f_prime, x_new, tol, max_iter)
 
     def extract_parameters(self):
-        """
-        Extract the four parameters of the single-diode model.
-        Rs
-        Rsh
-        A
-        I0
+        """This function extracts the four parameters of the single-diode model.
+
+        Returns:
+            None
         """
 
         import math
@@ -236,7 +234,7 @@ class PVModule:
             )
 
         interesting_v_points = [0, self.Vmpp_stc, self.Voc_stc]
-        interesting_i_points = [0, self.Impp_stc, self.Isc_stc]
+        interesting_i_points = [self.Isc_stc, self.Impp_stc, 0]
 
         Iph = self.Isc_stc  # approximation that makes sense
 
