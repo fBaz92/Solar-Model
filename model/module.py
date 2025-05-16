@@ -66,257 +66,6 @@ class PVModule:
         # Extract the five parameters of the model
         self.extract_parameters()
 
-    def extract_parameters(self):
-        """
-        Extract the five parameters of the single-diode model following
-        the flowchart in Fig. 2 of the paper by Sera et al., with improved
-        convergence behavior.
-        """
-        # Initialize parameters
-        Rs = 0.1  # Initial guess for series resistance
-        Rsh = 1000  # Initial guess for shunt resistance
-        A = 1.3  # Initial guess for ideality factor
-
-        # Maximum iterations and tolerances
-        MAX_ITERATIONS = 100
-        TOL_DPDV = 1e-6
-        TOL_DIDV = 1e-4  # Tolerance for dI/dV at Isc
-
-        # Function to calculate Io and Iph from Rs, Rsh, and Vt
-        def calculate_Io_Iph(Rs, Rsh, Vt):
-            numerator = self.Isc_stc - (self.Voc_stc - self.Isc_stc * Rs) / Rsh
-            denominator = np.exp(self.Voc_stc / (self.ns * Vt))
-            Io = numerator / denominator
-            Iph = Io * np.exp(self.Voc_stc / (self.ns * Vt)) + self.Voc_stc / Rsh
-            return Io, Iph
-
-        # Newton-Raphson method for finding Vt (and thus A) from Impp
-        def find_Vt_from_Impp(Rs, Rsh, Vt_guess):
-            Vt = Vt_guess
-            for _ in range(20):  # Max 20 iterations for this inner loop
-                # Calculate Io and Iph
-                Io, Iph = calculate_Io_Iph(Rs, Rsh, Vt)
-
-                # Calculate Impp using Eq. (12)
-                Impp_calc = (
-                    Iph
-                    - Io * np.exp((self.Vmpp_stc + self.Impp_stc * Rs) / (self.ns * Vt))
-                    - (self.Vmpp_stc + self.Impp_stc * Rs) / Rsh
-                )
-
-                # If close enough, return
-                if abs(Impp_calc - self.Impp_stc) < 1e-10:
-                    break
-
-                # Calculate derivative of Impp with respect to Vt (simplified approximation)
-                delta_Vt = Vt * 0.001
-                Vt_plus = Vt + delta_Vt
-
-                Io_plus, Iph_plus = calculate_Io_Iph(Rs, Rsh, Vt_plus)
-                Impp_calc_plus = (
-                    Iph_plus
-                    - Io_plus
-                    * np.exp((self.Vmpp_stc + self.Impp_stc * Rs) / (self.ns * Vt_plus))
-                    - (self.Vmpp_stc + self.Impp_stc * Rs) / Rsh
-                )
-
-                dImpp_dVt = (Impp_calc_plus - Impp_calc) / delta_Vt
-
-                # Newton-Raphson update
-                delta_Vt = (self.Impp_stc - Impp_calc) / dImpp_dVt
-
-                # Limit step size
-                delta_Vt = max(min(delta_Vt, Vt * 0.1), -Vt * 0.1)
-
-                Vt += delta_Vt
-
-                # Check convergence
-                if abs(delta_Vt) < 1e-10:
-                    break
-
-            return Vt
-
-        # Bisection method for finding Rsh from dP/dV at MPP
-        def find_Rsh_from_dPdV(Rs, Vt, Rsh_min=50, Rsh_max=5000):
-            Rsh_low = Rsh_min
-            Rsh_high = Rsh_max
-
-            for _ in range(30):  # Max 30 iterations
-                Rsh_mid = (Rsh_low + Rsh_high) / 2
-
-                # Calculate Io and Iph
-                Io, Iph = calculate_Io_Iph(Rs, Rsh_mid, Vt)
-
-                # Calculate dP/dV at MPP using numerical differentiation for stability
-                delta_V = 0.001 * self.Vmpp_stc
-
-                # Calculate power at Vmpp + delta_V
-                V_plus = self.Vmpp_stc + delta_V
-                I_plus = (
-                    Iph
-                    - Io * np.exp((V_plus + self.Impp_stc * Rs) / (self.ns * Vt))
-                    - (V_plus + self.Impp_stc * Rs) / Rsh_mid
-                )
-                P_plus = V_plus * I_plus
-
-                # Calculate power at Vmpp - delta_V
-                V_minus = self.Vmpp_stc - delta_V
-                I_minus = (
-                    Iph
-                    - Io * np.exp((V_minus + self.Impp_stc * Rs) / (self.ns * Vt))
-                    - (V_minus + self.Impp_stc * Rs) / Rsh_mid
-                )
-                P_minus = V_minus * I_minus
-
-                # Calculate dP/dV
-                dPdV = (P_plus - P_minus) / (2 * delta_V)
-
-                # Bisection update
-                if dPdV > 0:
-                    Rsh_low = Rsh_mid
-                else:
-                    Rsh_high = Rsh_mid
-
-                # Check convergence
-                if abs(dPdV) < TOL_DPDV or (Rsh_high - Rsh_low) < 1:
-                    break
-
-            return Rsh_mid
-
-        # Calculate dI/dV at Isc
-        def calculate_dIdV_at_Isc(Rs, Rsh, Vt):
-            # Calculate using numerical differentiation for stability
-            Io, Iph = calculate_Io_Iph(Rs, Rsh, Vt)
-
-            delta_V = 0.001  # Small voltage step
-
-            # Get I at V = 0 (short circuit)
-            I_sc = (
-                Iph
-                - Io * np.exp(self.Isc_stc * Rs / (self.ns * Vt))
-                - (self.Isc_stc * Rs) / Rsh
-            )
-
-            # Get I at V = delta_V
-            I_delta = (
-                Iph
-                - Io * np.exp((delta_V + self.Isc_stc * Rs) / (self.ns * Vt))
-                - (delta_V + self.Isc_stc * Rs) / Rsh
-            )
-
-            # Calculate dI/dV
-            dIdV = (I_delta - I_sc) / delta_V
-
-            return dIdV
-
-        # Main iteration loop
-        converged = False
-        previous_diff = None
-        for iteration in range(MAX_ITERATIONS):
-            # Step 1: Find Vt (and thus A) from Impp
-            Vt = find_Vt_from_Impp(Rs, Rsh, A * self.k * self.Tcell_stc / self.q)
-            A = Vt * self.q / (self.k * self.Tcell_stc)
-
-            # Make sure A stays within reasonable bounds
-            A = max(1.0, min(A, 2.0))
-            Vt = A * self.k * self.Tcell_stc / self.q
-
-            # Step 2: Find Rsh from dP/dV at MPP
-            Rsh_new = find_Rsh_from_dPdV(Rs, Vt)
-
-            # Step 3: Calculate dI/dV at Isc
-            dIdV_Isc = calculate_dIdV_at_Isc(Rs, Rsh_new, Vt)
-            expected_dIdV = -1 / Rsh_new
-
-            # Calculate difference
-            diff = dIdV_Isc - expected_dIdV
-
-            # Calculate dP/dV at MPP to check convergence
-            Io, Iph = calculate_Io_Iph(Rs, Rsh_new, Vt)
-
-            # Calculate dP/dV at MPP using numerical differentiation
-            delta_V = 0.001 * self.Vmpp_stc
-
-            # Calculate power at Vmpp + delta_V
-            V_plus = self.Vmpp_stc + delta_V
-            I_plus = (
-                Iph
-                - Io * np.exp((V_plus + self.Impp_stc * Rs) / (self.ns * Vt))
-                - (V_plus + self.Impp_stc * Rs) / Rsh_new
-            )
-            P_plus = V_plus * I_plus
-
-            # Calculate power at Vmpp - delta_V
-            V_minus = self.Vmpp_stc - delta_V
-            I_minus = (
-                Iph
-                - Io * np.exp((V_minus + self.Impp_stc * Rs) / (self.ns * Vt))
-                - (V_minus + self.Impp_stc * Rs) / Rsh_new
-            )
-            P_minus = V_minus * I_minus
-
-            # Calculate dP/dV
-            dPdV = (P_plus - P_minus) / (2 * delta_V)
-
-            # Step 4: Check convergence - both criteria from the paper
-            if abs(dPdV) < TOL_DPDV and abs(diff) < TOL_DIDV:
-                Rsh = Rsh_new
-                converged = True
-                break
-
-            # Step 5: Update Rs based on dI/dV at Isc with adaptive step size
-            # Note: The direction is REVERSED from the original implementation
-            # If dI/dV is more negative than expected, INCREASE Rs
-            # If dI/dV is less negative than expected, DECREASE Rs
-
-            # Calculate adaptive step size - larger steps when far from solution
-            # smaller steps when close to solution
-            scale_factor = min(max(abs(diff) / abs(expected_dIdV) * 5, 0.05), 0.2)
-
-            if dIdV_Isc < expected_dIdV:  # More negative
-                Rs_new = Rs * (1 + scale_factor)  # Increase Rs
-            else:  # Less negative
-                Rs_new = Rs * (1 - scale_factor)  # Decrease Rs
-
-            # Check for oscillation - if sign of difference changes, reduce step size
-            if previous_diff is not None and previous_diff * diff < 0:
-                # Sign changed - we might be oscillating
-                # Move halfway between current and previous Rs
-                Rs_new = (Rs + Rs_new) / 2
-
-            previous_diff = diff
-
-            # Update Rs and Rsh
-            Rs = max(0.01, min(Rs_new, 2.0))  # Keep Rs within reasonable bounds
-            Rsh = Rsh_new
-
-            # Print progress every 10 iterations
-            if iteration % 1 == 0:
-                print(
-                    f"Iteration {iteration}: Rs={Rs:.4f}, Rsh={Rsh:.1f}, A={A:.4f}, "
-                    f"dI/dV={dIdV_Isc:.6f}, expected={expected_dIdV:.6f}, diff={diff:.6f}, dP/dV={dPdV:.6f}"
-                )
-
-        # Calculate final Io and Iph
-        Io, Iph = calculate_Io_Iph(Rs, Rsh, Vt)
-
-        # Store the final parameters
-        self.Rs = Rs
-        self.Rsh = Rsh
-        self.A = A
-        self.Vt_stc = Vt
-        self.Io_stc = Io
-        self.Iph_stc = Iph
-
-        print(f"Extracted parameters for {self.name}:")
-        print(f"Series resistance (Rs): {self.Rs:.4f} Ω")
-        print(f"Shunt resistance (Rsh): {self.Rsh:.1f} Ω")
-        print(f"Ideality factor (A): {self.A:.4f}")
-        print(f"Dark saturation current (Io): {self.Io_stc:.2e} A")
-        print(f"Photocurrent (Iph): {self.Iph_stc:.4f} A")
-        print(f"Iterations required: {iteration + 1}")
-        print(f"Converged: {converged}")
-
     def get_iv_curve(self, voltage_range=None, irradiance=1000, temperature=25):
         """
         Calculate the I-V curve of the module at given irradiance and temperature.
@@ -394,6 +143,154 @@ class PVModule:
                 current[i] = 0
 
         return voltage_range, current
+
+    def _newton_raphson(self, f, f_prime, x0, tol=1e-4, max_iter=100):
+        """
+        Newton-Raphson method for solving non-linear equations.
+
+        Args:
+            f (function): The function to solve
+            f_prime (function): The derivative of the function
+            x0 (float): The initial guess
+            tol (float, optional): The tolerance. Defaults to 1e-4.
+            max_iter (int, optional): The maximum number of iterations. Defaults to 100.
+        """
+        value = f(x0)
+
+        x_new = x0 - value / f_prime(x0)
+
+        if abs(x_new - x0) < tol:
+            return x_new
+
+        return self._newton_raphson(f, f_prime, x_new, tol, max_iter)
+
+    def extract_parameters(self):
+        """
+        Extract the four parameters of the single-diode model.
+        Rs
+        Rsh
+        A
+        I0
+        """
+
+        import math
+
+        # Initialize parameters with more reasonable values based on datasheet
+        # Make initial estimate for Rs based on approximate voltage drop
+        Rs_max = (self.Voc_stc - self.Vmpp_stc) / self.Impp_stc
+        Rs_min = 1e-4
+
+        Rsh_min = self.Vmpp_stc / (self.Isc_stc - self.Impp_stc) - Rs_max
+        Rsh_max = 100 * Rsh_min
+
+        A_min = 1.0
+        A_max = 2.0
+        I0_min = 1e-11
+        I0_max = 1e-6
+
+        # Maximum iterations and tolerances
+        TOL = 1e-4
+
+        def f(Iph, I0, rs, A, rsh, v, i):
+            """function that describes the output current in function to the electrical parameters of a cell
+
+            Args:
+                Iph (float): _description_
+                I0 (float): _description_
+                rs (float): _description_
+                A (float): _description_
+                rsh (float): _description_
+                v (float): _description_
+                i (float): _description_
+
+            Returns:
+                error: returns the diffence between the expected current and the current that comes from the given electrical parameters
+            """
+            return (
+                Iph
+                - I0 * (math.exp((v + i * rs) / (self.ns * A * self.Vt)) - 1)
+                - i
+                - (v + i * rs) / rsh
+            )
+
+        def f_prime(Iph, I0, rs, A, rsh, v, i):
+            """Function that returns the derivative of the function f with respect to the current
+
+            Args:
+                I0 (float): Dark saturation current
+                rs (float): Series resistance
+                A (float): Ideality factor
+                rsh (float): Shunt resistance
+                v (float): Voltage
+                i (float): Current
+
+            Returns:
+                float: Derivative of the function f with respect to the current
+            """
+
+            return (
+                -(I0 * rs / (self.ns * A * self.Vt))
+                * (math.exp((v + i * rs) / (self.ns * A * self.Vt)))
+                - 1
+                - rs / rsh
+            )
+
+        interesting_v_points = [0, self.Vmpp_stc, self.Voc_stc]
+        interesting_i_points = [0, self.Impp_stc, self.Isc_stc]
+
+        Iph = self.Isc_stc  # approximation that makes sense
+
+        best_set_solutions = {"rs": None, "rsh": None, "a": None, "io": None}
+        error_best_set_solutions = float("inf")
+
+        for rs in np.linspace(Rs_min, Rs_max, 100):
+            for rsh in np.linspace(Rsh_min, Rsh_max, 100):
+                for a in np.linspace(A_min, A_max, 20):
+                    for io in np.linspace(I0_min, I0_max, 100):
+                        # define the function
+
+                        solutions = []
+
+                        for v, i_target in zip(
+                            interesting_v_points, interesting_i_points
+                        ):
+                            f_ = lambda i: f(Iph, io, rs, a, rsh, v, i)
+                            f_prime_ = lambda i: f_prime(Iph, io, rs, a, rsh, v, i)
+
+                            i_found = self._newton_raphson(f_, f_prime_, i_target)
+
+                            solutions.append(i_found)
+
+                        error = sum(abs(solutions - interesting_i_points))
+
+                        if error < error_best_set_solutions:
+                            error_best_set_solutions = error
+                            best_set_solutions = {
+                                "rs": rs,
+                                "rsh": rsh,
+                                "a": a,
+                                "io": io,
+                            }
+
+        print(f"Best set of solutions: {best_set_solutions}")
+        print(f"Error: {error_best_set_solutions}")
+
+        # # Store the final parameters
+        # self.Rs = Rs
+        # self.Rsh = Rsh
+        # self.A = A
+        # self.Vt_stc = Vt
+        # self.Io_stc = Io
+        # self.Iph_stc = Iph
+
+        # print(f"Extracted parameters for {self.name}:")
+        # print(f"Series resistance (Rs): {self.Rs:.4f} Ω")
+        # print(f"Shunt resistance (Rsh): {self.Rsh:.1f} Ω")
+        # print(f"Ideality factor (A): {self.A:.4f}")
+        # print(f"Dark saturation current (Io): {self.Io_stc:.2e} A")
+        # print(f"Photocurrent (Iph): {self.Iph_stc:.4f} A")
+        # print(f"Iterations required: {iteration + 1}")
+        # print(f"Converged: {converged}")
 
     def get_pv_curve(self, voltage_range=None, irradiance=1000, temperature=25):
         """
